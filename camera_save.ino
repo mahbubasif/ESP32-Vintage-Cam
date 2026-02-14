@@ -2,17 +2,18 @@
 #include <TFT_eSPI.h>
 #include "esp_camera.h"
 #include "FS.h"                
-#include "SD_MMC.h"            
+#include "SD_MMC.h"    
+#include "img_converters.h"         
 
 TFT_eSPI tft = TFT_eSPI(); 
 
-// --- PIN CHANGE: MOVED FROM 0 TO 12 ---
+// Button on GPIO 12
 #define CAPTURE_PIN 12 
 
 // --- CAMERA PINS ---
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0  // <-- This was the conflict!
+#define XCLK_GPIO_NUM      0
 #define SIOD_GPIO_NUM     26
 #define SIOC_GPIO_NUM     27
 #define Y9_GPIO_NUM       35
@@ -29,22 +30,19 @@ TFT_eSPI tft = TFT_eSPI();
 
 bool sdCardEnabled = false;
 int buttonState = 0;
-int lastButtonState = HIGH; // Default Pullup state is HIGH
+int lastButtonState = HIGH; 
 
 void setup() {
-  // 1. Safety Delay
   delay(1000);
 
-  // 2. Start SD Card FIRST (Priority)
-  // Pin 12 is safe to use as a button as long as we don't hold it 
-  // pressed DURING boot.
+  // 1. Start SD Card FIRST
   if(!SD_MMC.begin("/sdcard", true)){ 
     sdCardEnabled = false;
   } else {
     sdCardEnabled = true;
   }
 
-  // 3. Start Display
+  // 2. Start Display
   tft.init();
   tft.setRotation(0); 
   tft.fillScreen(TFT_BLACK);
@@ -62,11 +60,11 @@ void setup() {
   }
   delay(1000);
 
-  // 4. Setup Button on Pin 12
+  // 3. Setup Button
   pinMode(CAPTURE_PIN, INPUT_PULLUP);
   lastButtonState = digitalRead(CAPTURE_PIN); 
 
-  // 5. Configure Camera
+  // 4. Configure Camera (STAY IN RGB MODE FOREVER)
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -87,7 +85,7 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_RGB565; 
+  config.pixel_format = PIXFORMAT_RGB565; // Always RGB for Display
   config.frame_size = FRAMESIZE_240X240;
   config.fb_count = 1;
 
@@ -99,69 +97,61 @@ void setup() {
 }
 
 void loop() {
-  // A. Get RGB Frame for Preview
+  // A. Get RGB Frame
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) return;
 
   // Show Preview
   tft.pushImage(0, 0, 240, 240, (uint16_t *)fb->buf);
 
-  // B. Button Logic (Reading GPIO 12 now)
+  // B. Button Logic
   buttonState = digitalRead(CAPTURE_PIN);
 
-  // Detect "Press" (High -> Low transition)
   if (buttonState == LOW && lastButtonState == HIGH) {
     
-    // Release the Preview Frame
-    esp_camera_fb_return(fb); 
-    fb = NULL;
+    // 1. Show Visual Feedback
+    tft.fillCircle(120, 120, 10, TFT_WHITE); 
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString("CONVERTING...", 50, 20);
 
     if (!sdCardEnabled) {
-       tft.setTextColor(TFT_RED, TFT_BLACK);
-       tft.drawString("NO CARD!", 70, 20);
+       tft.drawString("NO CARD!", 70, 50);
        delay(500);
     } else {
-      // --- TAKE PHOTO SEQUENCE ---
-      tft.fillCircle(120, 120, 10, TFT_WHITE); // Flash Dot
-      tft.setTextColor(TFT_GREEN, TFT_BLACK);
-      tft.drawString("SAVING...", 70, 20);
       
-      // 2. Switch Sensor to JPEG Mode
-      sensor_t * s = esp_camera_sensor_get();
-      s->set_pixformat(s, PIXFORMAT_JPEG);
-      
-      // Give sensor time to switch modes 
-      delay(100); 
+      // 2. SOFTWARE CONVERSION (The Fix)
+      uint8_t * out_jpg = NULL; // Pointer for the new JPEG
+      size_t out_len = 0;       // Size of the new JPEG
 
-      // 3. Capture JPEG Frame
-      fb = esp_camera_fb_get();
-      if(fb) {
-        // Create unique name
+      // Convert the current RGB framebuffer (fb) to JPEG
+      // Quality: 0-100 (80 is good)
+      bool converted = frame2jpg(fb, 80, &out_jpg, &out_len);
+
+      if(converted) {
+        // Save the CONVERTED data, not the raw fb!
         String path = "/IMG_" + String(millis()) + ".jpg";
         fs::File file = SD_MMC.open(path.c_str(), FILE_WRITE);
         
         if(file){
-          file.write(fb->buf, fb->len);
+          file.write(out_jpg, out_len); // Write the JPEG buffer
           file.close();
-          tft.drawString("SAVED!   ", 70, 20);
+          tft.drawString("SAVED!     ", 70, 20);
         } else {
           tft.drawString("ERR Write", 70, 20);
         }
-        
-        delay(800); 
-        esp_camera_fb_return(fb);
-        fb = NULL; 
+
+        // Critical: Free the temporary memory used by the converter
+        free(out_jpg); 
+      } else {
+        tft.drawString("CONVERT FAIL", 40, 20);
       }
       
-      // 4. Switch back to RGB for Preview
-      s->set_pixformat(s, PIXFORMAT_RGB565);
+      delay(1000); 
     }
   } 
-  else {
-    // If button not pressed, just release the frame and continue
-    if(fb) esp_camera_fb_return(fb);
-  }
 
-  // Update button state for next loop
+  // Release the RGB frame back to the camera
+  esp_camera_fb_return(fb); 
+  
   lastButtonState = buttonState;
 }
